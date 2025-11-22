@@ -12,6 +12,9 @@ st.set_page_config(
     page_title="BVG-Umwandlungssatz-Analyse",
 )
 
+# Ab welchem Alter wird im Modell mit Sparen begonnen?
+SAVING_START_AGE = 25
+
 # ======================================================================
 # 1. MATHE-KERNFUNKTIONEN
 # ======================================================================
@@ -72,6 +75,11 @@ def compute_capital_at_retirement(
         capital = annual_contrib * future_value_factor
 
     return capital
+
+
+def compute_bvg_salary(gross_salary: float, coord_deduction: float) -> float:
+    """BVG-pflichtiger Lohn = max(0, Bruttolohn - Koordinationsabzug)."""
+    return max(0.0, gross_salary - coord_deduction)
 
 
 # ======================================================================
@@ -498,15 +506,15 @@ def main():
             age_now = st.slider("Aktuelles Alter", 20, 64, 35)
             ret_age = st.slider("Pensionierungsalter", 60, 70, 65)
 
-        # Sparjahre (Zukunft) und gesamte Sparjahre ab 25
+        # Sparjahre ab heute
         years_to_ret = ret_age - age_now
         if years_to_ret <= 0:
             st.error("Das Pensionierungsalter muss grösser sein als das aktuelle Alter.")
             return
 
-        age_start_saving = 25
-        years_saved_past = max(0, age_now - age_start_saving)
-        years_total_saving = max(0, ret_age - age_start_saving)
+        # Sparjahre insgesamt (ab 25) und bereits vergangene Jahre
+        years_past = max(0, age_now - SAVING_START_AGE)
+        years_total = max(0, ret_age - SAVING_START_AGE)
 
         # --- Spalte 3: Startjahr, Rentenjahr wird daraus berechnet ---
         min_year = int(le_df["Jahr"].min())
@@ -540,11 +548,18 @@ def main():
 
         with col_fin1:
             salary = st.number_input(
-                "Jährlicher Lohn (BVG-pflichtig) in CHF",
+                "Jährlicher Bruttolohn in CHF",
                 min_value=40_000,
                 max_value=200_000,
                 value=80_000,
                 step=5_000,
+            )
+            coord_deduction = st.number_input(
+                "Koordinationsabzug in CHF",
+                min_value=0,
+                max_value=50_000,
+                value=25_725,
+                step=500,
             )
             contrib = st.slider(
                 "BVG-Beitragssatz",
@@ -574,6 +589,9 @@ def main():
                 step=0.1,
             )
 
+        # BVG-pflichtiger Lohn
+        insured_salary = compute_bvg_salary(salary, coord_deduction)
+
         # Lebenserwartung: falls Rentenjahr > letzter BFS-Wert, letztes Jahr verwenden
         max_le_year = int(le_df["Jahr"].max())
         year_for_le_raw = year_ret
@@ -599,7 +617,7 @@ def main():
                 f"Es wird das nächste verfügbare Alter {age_used} verwendet."
             )
 
-        # Belastungsindex während der Sparphase (nur für gewähltes Szenario; Zukunft)
+        # Belastungsindex während der verbleibenden Sparphase (ab heute)
         burden_list = []
         factor_list = []
         year_list = []
@@ -614,15 +632,14 @@ def main():
 
         avg_factor = sum(factor_list) / len(factor_list) if factor_list else 1.0
 
-        # effektive Rendite und Kapital
+        # effektive Rendite und Kapital (gesamte Sparphase ab 25)
         r_base = params["return_active"]
         r_effective = r_base * avg_factor
 
-        # WICHTIG: Kapital basiert auf allen Sparjahren ab 25
         capital = compute_capital_at_retirement(
-            salary=salary,
+            salary=insured_salary,
             contrib_rate=contrib,
-            years_to_retirement=years_total_saving,
+            years_to_retirement=years_total,
             return_rate=r_effective,
             contrib_factor=params["contrib_factor"],
         )
@@ -645,7 +662,7 @@ def main():
         col_res1.metric(
             label="Alterskapital (2. Säule)",
             value=f"CHF {capital:,.0f}",
-            delta=f"Sparjahre gesamt: {years_total_saving} (bisher: {years_saved_past})",
+            delta=f"Total Sparjahre: {years_total} (davon {years_past} bereits, {years_to_ret} zukünftig)",
         )
 
         col_res2.metric(
@@ -697,6 +714,13 @@ def main():
                 delta_color="inverse",
             )
 
+        st.markdown("### Lohnbasis (Info)")
+        st.write(
+            f"- Bruttolohn: **CHF {salary:,.0f}**  \n"
+            f"- Koordinationsabzug: **CHF {coord_deduction:,.0f}**  \n"
+            f"- BVG-pflichtiger Lohn: **CHF {insured_salary:,.0f}**"
+        )
+
         st.markdown("### Visualisierung der Jahresrenten")
         chart_df = pd.DataFrame(
             {
@@ -710,17 +734,24 @@ def main():
     # TAB 2: BELASTUNGSINDEX
     # ------------------------------------------------------------------
     with tab_burden:
-        st.subheader("Belastungsindex & Renditepfad in der Sparphase")
+        st.subheader("Belastungsindex & Renditepfad in der verbleibenden Sparphase")
 
         st.markdown(
             """
             **Belastungsindex** = Bevölkerung 65+ geteilt durch Bevölkerung 20–64  
             (berechnet direkt aus den BFS-Bevölkerungsszenarien).
 
-            Im Modell wird der Belastungsindex nur für die *zukünftigen* Sparjahre
-            (von heute bis Pensionierung) betrachtet. Die bereits vergangenen
-            Sparjahre ab 25 werden der Einfachheit halber mit derselben
-            durchschnittlichen Rendite r_eff angenommen.
+            Die effektive Rendite in der Sparphase wird im Modell **zweistufig** bestimmt:
+
+            1. Jedes Szenario hat einen eigenen *Basiszins* (Kapitalmarkt-Umfeld).  
+            2. Dieser Basiszins wird über die Zeit mit einem Faktor aus dem Belastungsindex
+               multipliziert. Szenarien mit höherer demografischer Belastung führen damit
+               im Durchschnitt zu einer tieferen effektiven Rendite.
+
+            Wichtig: Die Szenariobezeichnung (z.B. „niedrige Geburtenhäufigkeit“) ist
+            eine **BFS-Kurzbeschreibung**. Entscheidend für die Rendite im Modell ist
+            der tatsächlich berechnete Belastungsindex-Pfad in deinem Sparfenster –
+            nicht das Label an sich.
             """
         )
 
@@ -739,16 +770,16 @@ def main():
                 df_burden_path.set_index("Jahr")[["Belastungsindex"]],
                 height=250,
             )
-            col_b1.caption("Pfad des Belastungsindex während der Sparphase (Zukunft).")
+            col_b1.caption("Pfad des Belastungsindex während der verbleibenden Sparphase.")
 
             col_b2.line_chart(
                 df_burden_path.set_index("Jahr")[["Rendite-Faktor"]],
                 height=250,
             )
-            col_b2.caption("Anpassungsfaktor für die Rendite pro Jahr (Zukunft).")
+            col_b2.caption("Anpassungsfaktor für die Rendite pro Jahr (ab heute).")
 
             st.metric(
-                label="Durchschnittlicher Belastungsindex in der zukünftigen Sparphase",
+                label="Durchschnittlicher Belastungsindex (ab heute)",
                 value=f"{df_burden_path['Belastungsindex'].mean():.2f}",
             )
             st.metric(
@@ -768,11 +799,13 @@ def main():
         st.markdown(
             """
             Hier werden **alle verfügbaren Szenarien** mit den gleichen Eingaben  
-            (Alter, Startjahr, Lohn, Beitragssatz, gewählter UWS, Elastizität) durchgerechnet.  
+            (Alter, Startjahr, Lohn, Koordinationsabzug, Beitragssatz, gewählter UWS, Elastizität) durchgerechnet.  
             Das aktuell im Tab *Modell* gewählte Szenario dient als **Baseline** für die Deltas.
 
-            Die Kapitalberechnung beruht auch hier immer auf der Annahme:
-            *Sparbeginn mit 25, durchgehend bis zum gewählten Pensionierungsalter.*
+            Für alle Szenarien gilt:
+            - Sparbeginn: Alter 25  
+            - Sparende: gewähltes Pensionierungsalter  
+            - Gleiches Lohn- und Beitragsprofil
             """
         )
 
@@ -781,7 +814,7 @@ def main():
         else:
             # Helferfunktion: ein Szenario komplett durchrechnen
             def compute_for_scenario(s_code: str, s_params: dict):
-                # Belastungsindex-Pfad (Zukunft)
+                # Belastungsindex-Pfad (ab heute bis Pensionierung)
                 local_burdens = []
                 for i in range(years_to_ret):
                     y = start_year + i
@@ -805,11 +838,11 @@ def main():
                 r_base_s = s_params["return_active"]
                 r_eff_s = r_base_s * avg_factor_s
 
-                # Kapital: wieder alle Sparjahre ab 25
+                # Kapital über gesamte Sparphase ab 25
                 capital_s = compute_capital_at_retirement(
-                    salary=salary,
+                    salary=insured_salary,
                     contrib_rate=contrib,
-                    years_to_retirement=years_total_saving,
+                    years_to_retirement=years_total,
                     return_rate=r_eff_s,
                     contrib_factor=s_params["contrib_factor"],
                 )
@@ -917,33 +950,32 @@ def main():
         st.subheader("Methodische Hinweise (Kurzfassung)")
 
         st.markdown(
-            """
+            f"""
             1. **Bevölkerungsszenarien (BFS)**  
                * Tabelle px-x-0104000000_102  
                * Aggregation 20–64 (Erwerbstätige) und 65+ (Pensionierte)  
                * Belastungsindex = 65+ / 20–64 je Szenario & Jahr  
 
             2. **Belastungsindex → Rendite in der Sparphase**  
-               * Für jedes Sparjahr in der Zukunft wird der Belastungsindex B(t) ermittelt  
+               * Für jedes Sparjahr ab heutigem Alter wird der Belastungsindex B(t) ermittelt  
                * Jahr für Jahr wird ein Rendite-Faktor  
-                 \\( f(t) = 1 − \\text{Elastizität} \\cdot (B(t) − B_{ref}) \\) berechnet  
-               * \\( r_{eff} = r_{Basis} \\cdot \\overline{f(t)} \\)  
+                 \\( f(t) = 1 − \\text{{Elastizität}} \\cdot (B(t) − B_{{ref}}) \\) berechnet  
+               * \\( r_{{eff}} = r_{{Basis}} \\cdot \\overline{{f(t)}} \\)  
+               * r_eff wird für die **gesamte Sparphase ab Alter {SAVING_START_AGE}** verwendet
+                 (didaktische Vereinfachung).
 
             3. **Rentenphase / fairer Umwandlungssatz**  
                * Lebenserwartung (ex) ab dem gewählten Pensionierungsalter
                  aus px-x-0102020300_102  
                * UWS_fair = 1 / Rentenbarwertfaktor (nachschüssig)  
 
-            4. **Sparbeginn mit 25**  
-               * Das Modell unterstellt, dass ab Alter 25 mit dem angegebenen
-                 Lohn & Beitragssatz gespart wird, bis zum gewählten
-                 Pensionierungsalter.  
-               * Bereits vergangene Sparjahre werden vereinfachend mit der
-                 gleichen durchschnittlichen Rendite r_eff bewertet.
+            4. **Koordinationsabzug**  
+               * BVG-pflichtiger Lohn = max(0, Bruttolohn − Koordinationsabzug)  
+               * Sämtliche Beiträge werden auf Basis dieses BVG-Lohnes berechnet.  
 
             5. **Didaktischer Charakter**  
-               * Modell ist bewusst vereinfacht (kein Koordinationsabzug,
-                 keine Lohnpfade, keine versicherungstechnischen Reserven),
+               * Modell ist bewusst vereinfacht (kein genauer Lohnpfad,
+                 keine versicherungstechnischen Reserven),
                  dient aber zur Illustration der Richtungseffekte aus
                  deiner schriftlichen Analyse im CAS Datenkompetenz.
             """
